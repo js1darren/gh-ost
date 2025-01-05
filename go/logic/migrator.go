@@ -362,12 +362,19 @@ func (this *Migrator) Migrate() (err error) {
 	// In MySQL 8.0 (and possibly earlier) some DDL statements can be applied instantly.
 	// Attempt to do this if AttemptInstantDDL is set.
 	if this.migrationContext.AttemptInstantDDL {
-		this.migrationContext.Log.Infof("Attempting to execute alter with ALGORITHM=INSTANT")
-		if err := this.applier.AttemptInstantDDL(); err == nil {
-			this.migrationContext.Log.Infof("Success! table %s.%s migrated instantly", sql.EscapeName(this.migrationContext.DatabaseName), sql.EscapeName(this.migrationContext.OriginalTableName))
-			return nil
+		if this.migrationContext.Noop {
+			this.migrationContext.Log.Debugf("Noop operation; not really attempting instant DDL")
 		} else {
-			this.migrationContext.Log.Infof("ALGORITHM=INSTANT not supported for this operation, proceeding with original algorithm: %s", err)
+			this.migrationContext.Log.Infof("Attempting to execute alter with ALGORITHM=INSTANT")
+			if err := this.applier.AttemptInstantDDL(); err == nil {
+				if err := this.hooksExecutor.onSuccess(); err != nil {
+					return err
+				}
+				this.migrationContext.Log.Infof("Success! table %s.%s migrated instantly", sql.EscapeName(this.migrationContext.DatabaseName), sql.EscapeName(this.migrationContext.OriginalTableName))
+				return nil
+			} else {
+				this.migrationContext.Log.Infof("ALGORITHM=INSTANT not supported for this operation, proceeding with original algorithm: %s", err)
+			}
 		}
 	}
 
@@ -380,6 +387,10 @@ func (this *Migrator) Migrate() (err error) {
 	// on master this is always true, of course, and yet it also implies this knowledge
 	// is in the binlogs.
 	if err := this.inspector.inspectOriginalAndGhostTables(); err != nil {
+		return err
+	}
+	// We can prepare some of the queries on the applier
+	if err := this.applier.prepareQueries(); err != nil {
 		return err
 	}
 	// Validation complete! We're good to execute this migration
@@ -808,11 +819,18 @@ func (this *Migrator) initiateStatus() {
 	this.printStatus(ForcePrintStatusAndHintRule)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	var previousCount int64
 	for range ticker.C {
 		if atomic.LoadInt64(&this.finishedMigrating) > 0 {
 			return
 		}
 		go this.printStatus(HeuristicPrintStatusRule)
+		totalCopied := atomic.LoadInt64(&this.migrationContext.TotalRowsCopied)
+		if previousCount > 0 {
+			copiedThisLoop := totalCopied - previousCount
+			atomic.StoreInt64(&this.migrationContext.EtaRowsPerSecond, copiedThisLoop)
+		}
+		previousCount = totalCopied
 	}
 }
 
@@ -914,9 +932,20 @@ func (this *Migrator) getMigrationETA(rowsEstimate int64) (eta string, duration 
 		duration = 0
 	} else if progressPct >= 0.1 {
 		totalRowsCopied := this.migrationContext.GetTotalRowsCopied()
-		elapsedRowCopySeconds := this.migrationContext.ElapsedRowCopyTime().Seconds()
-		totalExpectedSeconds := elapsedRowCopySeconds * float64(rowsEstimate) / float64(totalRowsCopied)
-		etaSeconds := totalExpectedSeconds - elapsedRowCopySeconds
+		etaRowsPerSecond := atomic.LoadInt64(&this.migrationContext.EtaRowsPerSecond)
+		var etaSeconds float64
+		// If there is data available on our current row-copies-per-second rate, use it.
+		// Otherwise we can fallback to the total elapsed time and extrapolate.
+		// This is going to be less accurate on a longer copy as the insert rate
+		// will tend to slow down.
+		if etaRowsPerSecond > 0 {
+			remainingRows := float64(rowsEstimate) - float64(totalRowsCopied)
+			etaSeconds = remainingRows / float64(etaRowsPerSecond)
+		} else {
+			elapsedRowCopySeconds := this.migrationContext.ElapsedRowCopyTime().Seconds()
+			totalExpectedSeconds := elapsedRowCopySeconds * float64(rowsEstimate) / float64(totalRowsCopied)
+			etaSeconds = totalExpectedSeconds - elapsedRowCopySeconds
+		}
 		if etaSeconds >= 0 {
 			duration = time.Duration(etaSeconds) * time.Second
 		} else {
@@ -1042,7 +1071,14 @@ func (this *Migrator) printStatus(rule PrintStatusRule, writers ...io.Writer) {
 	)
 	w := io.MultiWriter(writers...)
 	fmt.Fprintln(w, status)
-	this.migrationContext.Log.Infof(status)
+
+	// This "hack" is required here because the underlying logging library
+	// github.com/outbrain/golib/log provides two functions Info and Infof; but the arguments of
+	// both these functions are eventually redirected to the same function, which internally calls
+	// fmt.Sprintf. So, the argument of every function called on the DefaultLogger object
+	// migrationContext.Log will eventually pass through fmt.Sprintf, and thus the '%' character
+	// needs to be escaped.
+	this.migrationContext.Log.Info(strings.Replace(status, "%", "%%", 1))
 
 	hooksStatusIntervalSec := this.migrationContext.HooksStatusIntervalSec
 	if hooksStatusIntervalSec > 0 && elapsedSeconds%hooksStatusIntervalSec == 0 {
